@@ -27,14 +27,24 @@ seller.platform.com   →  (seller) Route Group
 
 ## 3. 디렉토리 구조
 
+> **2026-04-30 갱신 (Phase 1)**: 설계 초안의 `(admin)` / `(seller)` / `(consumer)` Route Group 은
+> Next.js 빌드 시 동일 URL 충돌(예: `(admin)/dashboard` 와 `(seller)/dashboard` 모두 `/dashboard`)
+> 이 발생하여 **실제 segment** 인 `admin/` / `seller/` / `consumer/[storeDomain]/` 으로 변경.
+> `(auth)` 만 Route Group 유지(URL 충돌 없음).
+
 ```text
 app/
-├── (auth)/
+├── page.tsx                                  # 로컬 dev 진입 페이지 (운영은 proxy 가 분기)
+├── layout.tsx                                # 루트 레이아웃 (Providers 래핑)
+├── providers.tsx                             # QueryClient + Devtools
+│
+├── (auth)/                                   # Route Group (URL 미반영)
 │   ├── login/page.tsx                        # [MEM-001] 로그인
 │   └── signup/page.tsx                       # [MEM-001] 회원가입
 │
-├── (admin)/                                  # 관리자 영역
+├── admin/                                    # /admin/* — 관리자 영역
 │   ├── layout.tsx                            # L-Type 레이아웃 (Sidebar + Main)
+│   ├── page.tsx                              # /admin → /admin/dashboard 리다이렉트
 │   ├── dashboard/page.tsx                    # [ADM-STA-001,002] 통계 대시보드
 │   ├── sellers/
 │   │   ├── page.tsx                          # [ADM-SEL-001] 판매자 리스트
@@ -42,8 +52,9 @@ app/
 │   ├── policy/page.tsx                       # [ADM-SET-001,002] 정산 정책 설정
 │   └── contents/page.tsx                     # [ADM-CNT-001,002] 배너·카테고리·보안 로그
 │
-├── (seller)/                                 # 판매자 영역
+├── seller/                                   # /seller/* — 판매자 영역
 │   ├── layout.tsx                            # L-Type 레이아웃 (Sidebar + Main)
+│   ├── page.tsx                              # /seller → /seller/dashboard 리다이렉트
 │   ├── dashboard/page.tsx                    # [SEL-STA-001] 통계 대시보드
 │   ├── members/page.tsx                      # [SEL-MEM-001] 회원 관리
 │   ├── products/
@@ -58,43 +69,76 @@ app/
 │   ├── settlement/page.tsx                   # [SEL-SET-001,002] 정산 관리
 │   └── cs/page.tsx                           # [SEL-CS-001] 고객 문의 관리
 │
-└── (consumer)/                               # 소비자 영역
-    └── [storeDomain]/
-        ├── layout.tsx                        # Top-Down 레이아웃 + FloatingAIChat
-        ├── page.tsx                          # [PRD-002,003] 홈 (AI 추천 피드, 카테고리)
-        ├── products/
-        │   ├── page.tsx                      # [PRD-001] 상품 검색
-        │   └── [productId]/page.tsx          # [PRD-004] 상품 상세 (리뷰, Q&A 포함)
-        ├── cart/page.tsx                     # [ORD-001] 장바구니
-        ├── checkout/page.tsx                 # [ORD-002, PAY-001,002] 주문/결제
-        └── mypage/
-            └── orders/page.tsx              # [MEM-003, ORD-004] 주문·배송 조회 및 취소/교환
+└── consumer/[storeDomain]/                   # /consumer/[store]/* — 소비자 영역
+    ├── layout.tsx                            # Top-Down 레이아웃 + FloatingAIChat
+    ├── page.tsx                              # [PRD-002,003] 홈 (AI 추천 피드, 카테고리)
+    ├── products/
+    │   ├── page.tsx                          # [PRD-001] 상품 검색
+    │   └── [productId]/page.tsx              # [PRD-004] 상품 상세 (리뷰, Q&A 포함)
+    ├── cart/page.tsx                         # [ORD-001] 장바구니
+    ├── checkout/page.tsx                     # [ORD-002, PAY-001,002] 주문/결제
+    └── mypage/
+        └── orders/page.tsx                   # [MEM-003, ORD-004] 주문·배송 조회 및 취소/교환
 ```
 
-## 4. 미들웨어 (middleware.ts) 처리 전략
+## 4. 프록시 (proxy.ts) 처리 전략
+
+> **Next.js 16 변경사항**: 기존 `middleware.ts` / `middleware()` 가 **`proxy.ts` / `proxy()`** 로
+> 명칭 변경 (기능 동일). 파일은 프로젝트 루트에 위치.
 
 ```ts
-// 접속 호스트네임 기준으로 Route Group Rewrite
-// admin.platform.com  → /admin/*
-// seller.platform.com → /seller/*
-// {store}.platform.com → /consumer/{store}/*  (DB 도메인 매핑 확인 후)
+// proxy.ts — 호스트네임 기준 Route Rewrite
+// admin.platform.com   → /admin/*
+// seller.platform.com  → /seller/*
+// {store}.platform.com → /consumer/{store}/*
 
-export function middleware(request: NextRequest) {
-  const hostname = request.headers.get('host');
+import { NextResponse, type NextRequest } from 'next/server';
 
-  if (hostname?.startsWith('admin.'))
+export function proxy(request: NextRequest) {
+  const hostname = request.headers.get('host') ?? '';
+  const { pathname } = request.nextUrl;
+
+  // 인증 페이지는 모든 호스트에서 동일 경로
+  if (pathname === '/login' || pathname === '/signup') return NextResponse.next();
+
+  // 이미 역할별 prefix 로 들어온 요청은 그대로 통과
+  if (
+    pathname.startsWith('/admin') ||
+    pathname.startsWith('/seller') ||
+    pathname.startsWith('/consumer')
+  ) {
+    return NextResponse.next();
+  }
+
+  const subdomain = hostname.split('.')[0]?.split(':')[0] ?? '';
+
+  if (subdomain === 'admin')
     return NextResponse.rewrite(new URL(`/admin${pathname}`, request.url));
 
-  if (hostname?.startsWith('seller.'))
+  if (subdomain === 'seller')
     return NextResponse.rewrite(new URL(`/seller${pathname}`, request.url));
 
-  // 스토어 도메인 → DB 조회 후 동적 라우팅
-  const storeDomain = hostname?.split('.')[0];
-  return NextResponse.rewrite(
-    new URL(`/consumer/${storeDomain}${pathname}`, request.url),
-  );
+  // 그 외 서브도메인 = 스토어 도메인
+  const isPlainLocalhost = hostname.startsWith('localhost');
+  const isBareDomain = !hostname.includes('.') || hostname.split('.').length < 3;
+  if (subdomain && !isPlainLocalhost && !isBareDomain) {
+    return NextResponse.rewrite(new URL(`/consumer/${subdomain}${pathname}`, request.url));
+  }
+
+  return NextResponse.next();
 }
+
+export const config = {
+  matcher: ['/((?!api|_next/static|_next/image|favicon.ico).*)'],
+};
 ```
+
+### 로컬 개발에서의 호스트 분기 테스트
+
+- 직접 path 진입: `http://localhost:3000/admin/dashboard` 처럼 그대로 사용 가능
+- 서브도메인 시뮬레이션 (선택):
+  - `*.localhost` 자동 지원 (Chrome / Firefox): `http://admin.localhost:3000/dashboard`
+  - 또는 `/etc/hosts` 에 `127.0.0.1 admin.local seller.local demo.local` 등록
 
 ## 5. 컴포넌트 설계
 
